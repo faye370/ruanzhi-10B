@@ -107,7 +107,7 @@ def get_mlm_candidates(mlm_model, mlm_tokenizer, words, word_idx, device, top_k=
         token = mlm_tokenizer.decode([tid]).strip()
         if token.lower() != original and token.isalpha() and "##" not in token:
             candidates.append(token)
-        if len(candidates) >= 48:
+        if len(candidates) >= 10:
             break
     return candidates
 
@@ -224,7 +224,7 @@ def run_experiment(model, tokenizer, dataset, num_examples, device, label,
     pert_texts = []
 
     for example in tqdm(dataset.select(range(num_examples)), desc=label):
-        text = example["text"]
+        text = example["text"][:800]
         true_label = example["label"]
 
         adv, queries, n_changed = sc_bert_attack(
@@ -261,7 +261,7 @@ def main(args):
 
     print("Loading BERT-MLM (bert-base-uncased) for candidate generation...")
     mlm_tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
-    mlm_model = BertForMaskedLM.from_pretrained("bert-base-uncased").to(device)
+    mlm_model = BertForMaskedLM.from_pretrained("bert-base-uncased")  # keep on CPU to avoid OOM
     mlm_model.eval()
 
     dataset = load_dataset(args.dataset, "plain_text", split="test")

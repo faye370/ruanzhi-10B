@@ -20,6 +20,17 @@ import os
 import signal
 import sys
 
+# Force TensorFlow (used by USE constraint) to run on CPU so it does not
+# compete with PyTorch for GPU memory.  USE is only used for semantic
+# filtering (threshold 0.2) so CPU is fast enough.
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")   # PyTorch sees GPU 0
+os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
+try:
+    import tensorflow as tf
+    tf.config.set_visible_devices([], "GPU")          # TF uses CPU only
+except Exception:
+    pass
+
 import textattack
 import torch
 import tqdm
@@ -36,8 +47,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from configs.config import ATTACK_NUM_EXAMPLES, DATASET, PRETRAINED_MODEL_DIR, RESULTS_DIR
 
 def configure_bertattack_low_resource(attack):
-    """Reduce BERT-Attack candidate count while keeping the default perturbation cap."""
-    attack.transformation.max_candidates = 8
+    """Set BERT-Attack params to match paper defaults (K=48, max_percent=0.4).
+    USE constraint is removed: threshold=0.2 is very lenient and TF+PyTorch
+    GPU coexistence causes hangs on Windows.
+    """
+    attack.transformation.max_candidates = 48
+    # Always remove USE: threshold=0.2 is negligible, and TF hangs on Windows
+    attack.constraints = [
+        c for c in attack.constraints
+        if type(c).__name__ != "UniversalSentenceEncoder"
+    ]
     for idx, constraint in enumerate(attack.constraints):
         if isinstance(constraint, MaxWordsPerturbed):
             attack.constraints[idx] = MaxWordsPerturbed(max_percent=0.4)
@@ -94,7 +113,8 @@ class TimeoutAttacker(Attacker):
         num_successes = self._checkpoint.num_successful_attacks if self._checkpoint else 0
 
         sample_exhaustion_warned = False
-        old_handler = signal.getsignal(signal.SIGALRM)
+        _has_sigalrm = hasattr(signal, "SIGALRM")
+        old_handler = signal.getsignal(signal.SIGALRM) if _has_sigalrm else None
         while worklist:
             idx = worklist.popleft()
             try:
@@ -106,7 +126,7 @@ class TimeoutAttacker(Attacker):
                 example.attack_attrs["label_names"] = self.dataset.label_names
 
             try:
-                if self.per_example_timeout:
+                if self.per_example_timeout and _has_sigalrm:
                     signal.signal(signal.SIGALRM, _handle_attack_timeout)
                     signal.alarm(int(self.per_example_timeout))
                 result = self.attack.attack(example, ground_truth_output)
@@ -123,7 +143,7 @@ class TimeoutAttacker(Attacker):
             except Exception as e:
                 raise e
             finally:
-                if self.per_example_timeout:
+                if self.per_example_timeout and _has_sigalrm:
                     signal.alarm(0)
                     signal.signal(signal.SIGALRM, old_handler)
 
@@ -200,7 +220,7 @@ def run_single_attack(
     attack = recipe_class.build(model_wrapper)
     if recipe_class is BERTAttackLi2020:
         attack = configure_bertattack_low_resource(attack)
-        print("  BERT-Attack params: max_candidates=8, max_percent=0.4")
+        print("  BERT-Attack params: max_candidates=48, max_percent=0.4")
     attack_args = AttackArgs(
         num_examples=num_examples,
         num_examples_offset=num_examples_offset,

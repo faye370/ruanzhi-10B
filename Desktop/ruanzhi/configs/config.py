@@ -12,5 +12,5 @@ CHECKPOINT_DIR = "./checkpoints/bert-imdb"
 # Use this to skip local training when no GPU is available.
 PRETRAINED_MODEL_DIR = "textattack/bert-base-uncased-imdb"
 
-ATTACK_NUM_EXAMPLES = 200
+ATTACK_NUM_EXAMPLES = 1000
 RESULTS_DIR = "./results"
