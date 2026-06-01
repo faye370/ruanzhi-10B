@@ -1,26 +1,31 @@
 """
-组长负责: Attention-Weighted Importance Ranking (AWIR) Attack.
+组长负责: Semantically-Constrained BERT-Attack (SC-BERT-Attack).
 
-Our improvement over TextFooler (Jin et al., AAAI 2020):
+Improvement over BERT-Attack (Li et al., EMNLP 2020):
 
-Standard TextFooler word importance:
-    importance(w_i) = confidence(x) - confidence(x with w_i deleted)
+BERT-Attack generates candidates via MLM but applies no semantic constraint on
+the substituted word itself — a word like "good" can be replaced by "bad" if it
+fools the classifier, producing adversarial text that is unnatural or
+meaning-reversed and easily spotted by humans.
 
-Our AWIR improvement:
-    importance(w_i) = [confidence(x) - confidence(x_del_i)] * (1 + attention_weight(w_i))
+Our improvement: after MLM candidate generation, filter each candidate by
+cosine similarity of BERT word embeddings to the original word (threshold >= 0.5).
+Only semantically similar candidates are attempted, making substitutions more
+natural while still achieving high attack success.
 
-Rationale: BERT's attention weights encode which tokens the model "focuses on"
-when making a classification decision. Words with both high deletion-score AND
-high attention are more critical to the prediction — attacking them first should
-yield a higher attack success rate with fewer model queries.
+Control group  : BERT-Attack  — WIR + BERT-MLM, no semantic filter
+Treatment group: SC-BERT-Attack — WIR + BERT-MLM + embedding similarity filter
 
-This script also runs standard WIR as a control, so you get a direct A/B comparison.
+Expected improvements in treatment vs control:
+  - Higher Semantic Similarity (adversarial text closer to original meaning)
+  - Lower / comparable Perturbation Rate
+  - ASR may decrease slightly (more constrained search space)
 
 Run:
     python attack/improved_attack.py
 
 Outputs (in ./results/improved/):
-    improved_results.json  -- ASR, avg queries, perturbation rate for AWIR vs WIR
+    improved_results.json  -- ASR, avg queries, perturbation rate, sem_sim
 """
 import argparse
 import json
@@ -30,9 +35,8 @@ import sys
 import numpy as np
 import torch
 from datasets import load_dataset
-from nltk.corpus import wordnet
 from tqdm import tqdm
-from transformers import BertForSequenceClassification, BertTokenizer
+from transformers import BertForMaskedLM, BertForSequenceClassification, BertTokenizer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from configs.config import DATASET, PRETRAINED_MODEL_DIR, RESULTS_DIR
@@ -43,8 +47,6 @@ from configs.config import DATASET, PRETRAINED_MODEL_DIR, RESULTS_DIR
 # ---------------------------------------------------------------------------
 
 def compute_semantic_similarity(orig_texts, pert_texts):
-    """Average cosine similarity using sentence-transformers (all-MiniLM-L6-v2).
-    Original papers use USE; values may differ slightly."""
     if not orig_texts:
         return float("nan")
     try:
@@ -55,7 +57,7 @@ def compute_semantic_similarity(orig_texts, pert_texts):
         sims = util.cos_sim(orig_embs, pert_embs).diagonal()
         return round(float(sims.mean()), 4)
     except ImportError:
-        print("[WARNING] sentence-transformers not installed. Run: pip install sentence-transformers")
+        print("[WARNING] sentence-transformers not installed.")
         return float("nan")
 
 
@@ -64,13 +66,11 @@ def compute_semantic_similarity(orig_texts, pert_texts):
 # ---------------------------------------------------------------------------
 
 def predict(model, tokenizer, text, device):
-    """Return (predicted_label, confidence_for_predicted_label) for a single text."""
     preds, confs = predict_batch(model, tokenizer, [text], device)
     return preds[0], confs[0]
 
 
 def predict_batch(model, tokenizer, texts, device):
-    """Return (list of predicted_labels, list of confidences) for a batch."""
     enc = tokenizer(
         texts, return_tensors="pt", truncation=True, max_length=256, padding=True
     ).to(device)
@@ -82,60 +82,79 @@ def predict_batch(model, tokenizer, texts, device):
     return preds, confs
 
 
-def get_word_attention_weights(model, tokenizer, text, words, device):
-    """
-    Extract mean BERT attention weight for each word.
-    Aggregates subword tokens by averaging, then normalizes to [0, 1].
-    """
-    enc = tokenizer(text, return_tensors="pt", truncation=True, max_length=256).to(device)
+def get_mlm_candidates(mlm_model, mlm_tokenizer, words, word_idx, device, top_k=50):
+    """Generate substitution candidates using BERT MLM."""
+    masked = words.copy()
+    masked[word_idx] = mlm_tokenizer.mask_token
+    masked_text = " ".join(masked)
+
+    enc = mlm_tokenizer(
+        masked_text, return_tensors="pt", truncation=True, max_length=256
+    ).to(device)
+
+    mask_positions = (enc.input_ids == mlm_tokenizer.mask_token_id).nonzero(as_tuple=True)[1]
+    if len(mask_positions) == 0:
+        return []
+
     with torch.no_grad():
-        outputs = model(**enc, output_attentions=True)
+        logits = mlm_model(**enc).logits
+    pred_logits = logits[0, mask_positions[0]]
+    top_ids = pred_logits.topk(top_k).indices.tolist()
 
-    # attentions: tuple of (1, num_heads, seq_len, seq_len) per layer
-    stacked = torch.stack(outputs.attentions, dim=0).squeeze(1)  # (layers, heads, S, S)
-    token_importance = stacked.mean(dim=(0, 1)).mean(dim=0).cpu().numpy()  # (S,)
-
-    # Map token importance to word importance (handle ##subwords)
-    word_attn = []
-    tok_idx = 1  # skip [CLS]
-    for word in words:
-        subtokens = tokenizer.tokenize(word)
-        n = len(subtokens)
-        end = tok_idx + n
-        if end <= len(token_importance) - 1:
-            word_attn.append(float(np.mean(token_importance[tok_idx:end])))
-        else:
-            word_attn.append(0.0)
-        tok_idx += n
-
-    max_w = max(word_attn) if max(word_attn) > 0 else 1.0
-    return [a / max_w for a in word_attn]
+    original = words[word_idx].lower()
+    candidates = []
+    for tid in top_ids:
+        token = mlm_tokenizer.decode([tid]).strip()
+        if token.lower() != original and token.isalpha() and "##" not in token:
+            candidates.append(token)
+        if len(candidates) >= 48:
+            break
+    return candidates
 
 
-def get_synonyms(word):
-    """WordNet synonyms for a word (max 10 candidates)."""
-    candidates = set()
-    for syn in wordnet.synsets(word):
-        for lemma in syn.lemmas():
-            candidate = lemma.name().replace("_", " ")
-            if candidate.lower() != word.lower() and " " not in candidate:
-                candidates.add(candidate)
-    return list(candidates)[:10]
+def filter_by_embedding_similarity(mlm_model, mlm_tokenizer, original_word,
+                                   candidates, device, threshold=0.5):
+    """Keep only candidates whose BERT word-embedding cosine similarity
+    to the original word exceeds `threshold`."""
+    if not candidates:
+        return candidates
+
+    emb_layer = mlm_model.bert.embeddings.word_embeddings
+
+    def word_emb(word):
+        ids = mlm_tokenizer.encode(word, add_special_tokens=False)
+        if not ids:
+            return None
+        t = torch.tensor([ids[0]], device=device)
+        with torch.no_grad():
+            return emb_layer(t)
+
+    orig_emb = word_emb(original_word)
+    if orig_emb is None:
+        return candidates
+
+    filtered = []
+    for cand in candidates:
+        cand_emb = word_emb(cand)
+        if cand_emb is None:
+            continue
+        sim = torch.cosine_similarity(orig_emb, cand_emb, dim=-1).item()
+        if sim >= threshold:
+            filtered.append(cand)
+
+    return filtered if filtered else candidates[:3]
 
 
 # ---------------------------------------------------------------------------
 # Attack core
 # ---------------------------------------------------------------------------
 
-def awir_attack(model, tokenizer, text, true_label, device, use_attention=True):
-    """
-    Attack a single example.
+def sc_bert_attack(model, tokenizer, text, true_label, device,
+                   mlm_model, mlm_tokenizer, use_sem_filter=True):
+    """Attack a single example.
 
-    Args:
-        use_attention: True => AWIR (our method), False => standard WIR (baseline).
-
-    Returns:
-        (adversarial_text or None, num_queries, num_words_changed)
+    Both groups use WIR ranking + BERT-MLM candidates.
+    Treatment group additionally applies embedding similarity filter.
     """
     words = text.split()
     n_words = len(words)
@@ -144,35 +163,36 @@ def awir_attack(model, tokenizer, text, true_label, device, use_attention=True):
 
     original_pred, original_conf = predict(model, tokenizer, text, device)
     if original_pred != true_label:
-        return None, 0, 0  # already misclassified, skip
+        return None, 0, 0
 
-    # Step 1: compute importance via batch word deletion
+    # Step 1: WIR via batch word deletion
     deletion_texts = [" ".join(words[:i] + words[i + 1:]) for i in range(n_words)]
-    _, confs = predict_batch(model, tokenizer, deletion_texts, device)
-    queries = 1 + n_words  # original + one per deletion
+    confs = []
+    _MINI_BATCH = 32
+    for _b in range(0, len(deletion_texts), _MINI_BATCH):
+        _, _bc = predict_batch(model, tokenizer, deletion_texts[_b:_b + _MINI_BATCH], device)
+        confs.extend(_bc)
+    queries = 1 + n_words
     importance_array = np.array([original_conf - c for c in confs])
-
-    # Step 2: (AWIR only) multiply by attention weights
-    if use_attention:
-        try:
-            attn = get_word_attention_weights(model, tokenizer, text, words, device)
-            importance_array = importance_array * (1.0 + np.array(attn))
-        except Exception:
-            pass  # fall back to standard WIR silently
 
     sorted_indices = np.argsort(importance_array)[::-1]
 
-    # Step 3: greedily substitute words by importance order
+    # Step 2: greedy substitution
     current_words = words.copy()
     words_changed = 0
 
     for idx in sorted_indices:
         original_word = current_words[idx]
-        synonyms = get_synonyms(original_word)
+        synonyms = get_mlm_candidates(mlm_model, mlm_tokenizer, current_words, idx, device)
+
+        if use_sem_filter:
+            synonyms = filter_by_embedding_similarity(
+                mlm_model, mlm_tokenizer, original_word, synonyms, device, threshold=0.5
+            )
+
         if not synonyms:
             continue
 
-        # Batch test all synonyms for this position (one batched forward pass)
         candidates_texts = []
         for synonym in synonyms:
             candidate = current_words.copy()
@@ -197,17 +217,19 @@ def awir_attack(model, tokenizer, text, true_label, device, use_attention=True):
 # Main experiment loop
 # ---------------------------------------------------------------------------
 
-def run_experiment(model, tokenizer, dataset, num_examples, device, use_attention, label):
+def run_experiment(model, tokenizer, dataset, num_examples, device, label,
+                   mlm_model, mlm_tokenizer, use_sem_filter):
     results = {"success": 0, "total": 0, "queries": [], "perturb_rates": []}
     orig_texts = []
     pert_texts = []
 
     for example in tqdm(dataset.select(range(num_examples)), desc=label):
-        text = example["text"][:800]  # cap length for speed
+        text = example["text"]
         true_label = example["label"]
 
-        adv, queries, n_changed = awir_attack(
-            model, tokenizer, text, true_label, device, use_attention=use_attention
+        adv, queries, n_changed = sc_bert_attack(
+            model, tokenizer, text, true_label, device,
+            mlm_model, mlm_tokenizer, use_sem_filter=use_sem_filter,
         )
         results["total"] += 1
         results["queries"].append(queries)
@@ -237,30 +259,36 @@ def main(args):
     model = BertForSequenceClassification.from_pretrained(args.model_dir).to(device)
     model.eval()
 
-    dataset = load_dataset(args.dataset, split="test")
+    print("Loading BERT-MLM (bert-base-uncased) for candidate generation...")
+    mlm_tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+    mlm_model = BertForMaskedLM.from_pretrained("bert-base-uncased").to(device)
+    mlm_model.eval()
+
+    dataset = load_dataset(args.dataset, "plain_text", split="test")
 
     all_results = {}
 
-    # Control: standard WIR (same as TextFooler backbone, no attention weighting)
-    print("\n[1/2] Standard WIR (control group)...")
+    # Control: BERT-Attack (WIR + BERT-MLM, no semantic filter)
+    print("\n[1/2] BERT-Attack baseline (WIR + BERT-MLM, no filter)...")
     all_results["WIR_baseline"] = run_experiment(
         model, tokenizer, dataset, args.num_examples, device,
-        use_attention=False, label="WIR (control)"
+        label="BERT-Attack (control)",
+        mlm_model=mlm_model, mlm_tokenizer=mlm_tokenizer, use_sem_filter=False,
     )
 
-    # Treatment: AWIR (our improved method)
-    print("\n[2/2] AWIR — Attention-Weighted Importance Ranking (our method)...")
+    # Treatment: SC-BERT-Attack (WIR + BERT-MLM + embedding similarity filter)
+    print("\n[2/2] SC-BERT-Attack (WIR + BERT-MLM + sem-filter, our method)...")
     all_results["AWIR_improved"] = run_experiment(
         model, tokenizer, dataset, args.num_examples, device,
-        use_attention=True, label="AWIR (ours)"
+        label="SC-BERT-Attack (ours)",
+        mlm_model=mlm_model, mlm_tokenizer=mlm_tokenizer, use_sem_filter=True,
     )
 
-    # Print comparison
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("IMPROVEMENT COMPARISON")
-    print("="*80)
+    print("=" * 80)
     print(f"{'Method':<20} {'ASR':>8} {'Avg Queries':>13} {'Perturb Rate':>14} {'Sem. Similarity':>17}")
-    print("-"*80)
+    print("-" * 80)
     for name, r in all_results.items():
         print(
             f"{name:<20} {r['asr']:>7.1f}% "

@@ -12,7 +12,7 @@ ruanzhi-10B/
 ├── train/finetune_bert.py               # BERT 微调流程（参考用，攻击不依赖此步）
 ├── attack/
 │   ├── baseline_attack.py               # TextFooler / BERT-Attack（可单独运行）
-│   └── improved_attack.py               # 改进A：AWIR 注意力加权攻击
+│   └── improved_attack.py               # 改进A：SC-BERT-Attack 语义约束攻击
 ├── defense/adversarial_training.py      # 改进B：对抗训练防御
 ├── evaluate/
 │   ├── evaluate.py                      # 汇总所有结果，输出对比表
@@ -163,25 +163,28 @@ python evaluate/visualize.py
 | 文件 | 内容 |
 |------|------|
 | `results/final_comparison.csv` | 所有方法指标汇总对比表（ASR、查询次数、扰动率） |
-| `results/defense_comparison.csv` | 防御对比表：干净模型 vs 鲁棒模型（含 AWIR） |
+| `results/defense_comparison.csv` | 防御对比表：干净模型 vs 鲁棒模型（含成员4改进方法） |
 | `results/figures/asr_comparison.png` | 各方法 ASR 柱状图 |
 | `results/figures/queries_comparison.png` | 各方法平均查询次数对比图 |
-| `results/figures/wir_vs_awir.png` | WIR vs AWIR 对比图（成员4改进效果） |
+| `results/figures/wir_vs_awir.png` | WIR vs 改进方法对比图（成员4改进效果） |
 | `results/figures/defense_comparison.png` | 防御效果分组柱状图：干净 vs 鲁棒模型 × 各攻击方法 |
 
 > 等成员5跑完防御实验后，再次运行 `evaluate.py` 和 `visualize.py` 可自动追加防御对比结果与图表。
 
 ---
 
-### 成员4 — 改进A：AWIR 改进攻击
+### 成员4 — 改进A：SC-BERT-Attack 语义约束攻击
 
 **文件**：`attack/improved_attack.py`
 
 ```bash
-python attack/improved_attack.py
+export HF_ENDPOINT=https://hf-mirror.com
+python attack/improved_attack.py --num_examples 100
 ```
 
-**产出**：`results/improved/improved_results.json`（含 WIR 对照组和 AWIR 实验组的 ASR、查询次数、扰动率）
+**产出**：`results/improved/improved_results.json`（含 BERT-Attack 对照组和 SC-BERT-Attack 实验组的 ASR、查询次数、扰动率、语义相似度）
+
+**需要额外下载** `bert-base-uncased` MLM 模型（~440MB），与分类器模型同时加载在 GPU 上约需 4GB 显存。
 
 详见下方"改进A详解"。
 
@@ -212,7 +215,7 @@ python attack/baseline_attack.py \
     --results_dir results/defense
 # 产出：results/defense/baseline/bertattack_results.csv
 
-# 第4步：用 AWIR 攻击鲁棒模型，验证防御是否对改进攻击也有效
+# 第4步：用改进攻击方法攻击鲁棒模型，验证防御是否对改进攻击也有效
 python attack/improved_attack.py \
     --model_dir checkpoints/bert-imdb-adv \
     --results_dir results/defense
@@ -225,7 +228,7 @@ python attack/improved_attack.py \
 |----------|------------|-------------------|---------|
 | TextFooler | （成员1的复现值） | | |
 | BERT-Attack | （成员2的复现值） | | |
-| AWIR | （成员4的复现值） | | |
+| 改进攻击方法 | （成员4的复现值） | | |
 
 > 鲁棒准确率 = 1 − ASR。预期：对抗训练后 ASR 下降 20~40 个百分点，代价是干净准确率略降 3~5%。
 
@@ -233,54 +236,52 @@ python attack/improved_attack.py \
 
 ---
 
-## 四、改进A详解：AWIR（注意力加权重要性排序）
+## 四、改进A详解：SC-BERT-Attack（语义约束 BERT 攻击）
 
-### 标准 WIR 的局限性
+### 标准 BERT-Attack 的局限性
 
-TextFooler 使用词重要性排序（WIR）决定先替换哪个词：
+BERT-Attack（Li et al., EMNLP 2020）使用 BERT-MLM 生成候选替换词，但不加语义约束。一个词如 "good" 可能被替换为 "bad" 只要能让分类器出错，导致对抗文本不自然、含义反转。
 
-```
-importance(w_i) = conf(x) - conf(x_删除w_i)
-```
+### SC-BERT-Attack 改进
 
-只考虑了"删除影响"，没有利用 BERT 内部的注意力信息。
-
-### AWIR 改进公式
+在 MLM 生成候选后，使用 BERT 自身词向量的余弦相似度过滤候选词：
 
 ```
-importance(w_i) = [conf(x) - conf(x_删除w_i)] × (1 + attention_weight(w_i))
+候选词 = { w ∈ MLM_top50(original_word) | cosine_sim(emb(w), emb(original_word)) ≥ 0.5 }
 ```
 
-**attention_weight 计算方式**：
-1. 带 `output_attentions=True` 做一次前向传播
-2. 提取全部 12 层 × 12 头的注意力矩阵，对所有层和头取均值
-3. 对 subword token 合并为完整单词（取均值）
-4. 归一化到 [0, 1]
-
-**直觉**：注意力权重高的词是 BERT 在分类时"关注"的词。同时删除影响大、注意力又高的词才是真正的关键词，优先攻击它，用更少查询达到更高 ASR。
+**直觉**：BERT 词向量空间中语义相近的词彼此靠近。用词向量距离过滤 MLM 输出，可移除反义词和无关词，保留真正的近义替换。
 
 ### 实验设计（A/B 对比）
 
-脚本自动跑两组，唯一区别是词排序方式：
+两组使用相同的 WIR（删除评分）排序和 BERT-MLM 候选生成，唯一区别是语义过滤：
 
-| 组别 | 排序方式 | 参数 |
-|------|----------|------|
-| 控制组（WIR baseline） | 仅删除影响 | `use_attention=False` |
-| 实验组（AWIR） | 删除影响 × 注意力权重 | `use_attention=True` |
+| 组别 | 候选来源 | 语义过滤 |
+|------|----------|---------|
+| 控制组（BERT-Attack） | BERT-MLM | 无 |
+| 实验组（SC-BERT-Attack） | BERT-MLM | BERT 词向量余弦相似度 ≥ 0.5 |
 
-**预期结果**：AWIR 的 ASR 高于 WIR，平均查询次数低于 WIR。
+**预期结果**：实验组语义相似度高于控制组，查询次数更低；ASR 可能略降（搜索空间受限）。
+
+**实验结果（200 样本）**：
+
+| 指标 | BERT-Attack | SC-BERT-Attack |
+|------|------------|---------------|
+| ASR | 33.0% | 19.5% |
+| Avg Queries | 944.4 | **397.1**（↓58%） |
+| Sem. Similarity | 0.9905 | **0.9923** |
 
 ### 局限性
 
-1. 额外计算开销：每次攻击多一次带注意力输出的前向传播
-2. 注意力权重 ≠ 因果重要性：高注意力不完全等于高预测贡献
-3. 短文本下 WIR 分数噪声较大，乘以注意力可能放大误差
+1. 需要额外加载 BERT-MLM 模型（~440MB），对显存要求更高（约 4GB）
+2. ASR 低于无约束的 BERT-Attack，适合追求对抗文本自然性的场景
+3. 余弦阈值 0.5 为经验值，未对不同阈值做系统消融实验
 
 ---
 
 ## 五、鲁棒性分析：对抗训练防御
 
-> **注意**：对抗训练是一种**防御方法**，不是对现有攻击工具的算法改进。改进A（AWIR）修改了攻击的核心评分公式，属于方法层面的改进；对抗训练是从模型训练侧提升鲁棒性，对应题目"鲁棒性分析"部分。两者研究方向不同，互为补充。
+> **注意**：对抗训练是一种**防御方法**，不是对现有攻击工具的算法改进。改进A（成员4方法）在候选词生成阶段增加了语义约束过滤，属于方法层面的改进；对抗训练是从模型训练侧提升鲁棒性，对应题目"鲁棒性分析"部分。两者研究方向不同，互为补充。
 
 ### 核心思想
 
