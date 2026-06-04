@@ -90,7 +90,7 @@ def get_mlm_candidates(mlm_model, mlm_tokenizer, words, word_idx, device, top_k=
 
     enc = mlm_tokenizer(
         masked_text, return_tensors="pt", truncation=True, max_length=256
-    ).to(device)
+    )  # keep on CPU to match mlm_model
 
     mask_positions = (enc.input_ids == mlm_tokenizer.mask_token_id).nonzero(as_tuple=True)[1]
     if len(mask_positions) == 0:
@@ -120,12 +120,13 @@ def filter_by_embedding_similarity(mlm_model, mlm_tokenizer, original_word,
         return candidates
 
     emb_layer = mlm_model.bert.embeddings.word_embeddings
+    emb_device = next(emb_layer.parameters()).device  # mlm_model stays on CPU
 
     def word_emb(word):
         ids = mlm_tokenizer.encode(word, add_special_tokens=False)
         if not ids:
             return None
-        t = torch.tensor([ids[0]], device=device)
+        t = torch.tensor([ids[0]], device=emb_device)
         with torch.no_grad():
             return emb_layer(t)
 
@@ -218,12 +219,25 @@ def sc_bert_attack(model, tokenizer, text, true_label, device,
 # ---------------------------------------------------------------------------
 
 def run_experiment(model, tokenizer, dataset, num_examples, device, label,
-                   mlm_model, mlm_tokenizer, use_sem_filter):
+                   mlm_model, mlm_tokenizer, use_sem_filter, checkpoint_path=None):
     results = {"success": 0, "total": 0, "queries": [], "perturb_rates": []}
     orig_texts = []
     pert_texts = []
+    start_idx = 0
 
-    for example in tqdm(dataset.select(range(num_examples)), desc=label):
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        try:
+            with open(checkpoint_path, "r") as f:
+                ckpt = json.load(f)
+            results = ckpt["results"]
+            orig_texts = ckpt["orig_texts"]
+            pert_texts = ckpt["pert_texts"]
+            start_idx = ckpt["next_idx"]
+            print(f"  Resuming from checkpoint: {start_idx}/{num_examples} done", flush=True)
+        except Exception as e:
+            print(f"  Checkpoint load failed ({e}), starting fresh", flush=True)
+
+    for i, example in enumerate(tqdm(dataset.select(range(start_idx, num_examples)), desc=label)):
         text = example["text"][:800]
         true_label = example["label"]
 
@@ -240,6 +254,11 @@ def run_experiment(model, tokenizer, dataset, num_examples, device, label,
             results["perturb_rates"].append(n_changed / n_words if n_words > 0 else 0)
             orig_texts.append(text)
             pert_texts.append(adv)
+
+        if checkpoint_path:
+            with open(checkpoint_path, "w") as f:
+                json.dump({"results": results, "orig_texts": orig_texts,
+                           "pert_texts": pert_texts, "next_idx": start_idx + i + 1}, f)
 
     results["asr"] = results["success"] / results["total"] * 100
     results["avg_queries"] = float(np.mean(results["queries"]))
@@ -267,6 +286,8 @@ def main(args):
     dataset = load_dataset(args.dataset, "plain_text", split="test")
 
     all_results = {}
+    ckpt_ctrl = os.path.join(out_dir, "ckpt_control.json")
+    ckpt_trt  = os.path.join(out_dir, "ckpt_treatment.json")
 
     # Control: BERT-Attack (WIR + BERT-MLM, no semantic filter)
     print("\n[1/2] BERT-Attack baseline (WIR + BERT-MLM, no filter)...")
@@ -274,6 +295,7 @@ def main(args):
         model, tokenizer, dataset, args.num_examples, device,
         label="BERT-Attack (control)",
         mlm_model=mlm_model, mlm_tokenizer=mlm_tokenizer, use_sem_filter=False,
+        checkpoint_path=ckpt_ctrl,
     )
 
     # Treatment: SC-BERT-Attack (WIR + BERT-MLM + embedding similarity filter)
@@ -282,6 +304,7 @@ def main(args):
         model, tokenizer, dataset, args.num_examples, device,
         label="SC-BERT-Attack (ours)",
         mlm_model=mlm_model, mlm_tokenizer=mlm_tokenizer, use_sem_filter=True,
+        checkpoint_path=ckpt_trt,
     )
 
     print("\n" + "=" * 80)
@@ -301,6 +324,13 @@ def main(args):
     with open(output_path, "w") as f:
         json.dump(all_results, f, indent=2)
     print(f"\nResults saved to {output_path}")
+
+    # Clean up checkpoints on successful completion
+    for p in [ckpt_ctrl, ckpt_trt]:
+        try:
+            os.remove(p)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

@@ -1,0 +1,1 @@
+{'method': 'BERT-Attack', 'total': 1, 'success': 0, 'asr': 0.0, 'avg_words_changed': nan, 'sem_sim': nan}

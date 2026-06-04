@@ -16,20 +16,18 @@ Paper targets to reproduce (IMDB, BERT victim):
     BERT-Attack: Attack Success Rate ~90%+
 """
 import argparse
+import glob
 import os
+import pickle
 import signal
 import sys
+import threading
 
 # Force TensorFlow (used by USE constraint) to run on CPU so it does not
 # compete with PyTorch for GPU memory.  USE is only used for semantic
 # filtering (threshold 0.2) so CPU is fast enough.
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")   # PyTorch sees GPU 0
-os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
-try:
-    import tensorflow as tf
-    tf.config.set_visible_devices([], "GPU")          # TF uses CPU only
-except Exception:
-    pass
+os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"     # TF allocates GPU memory on demand
 
 import textattack
 import torch
@@ -46,17 +44,15 @@ from transformers import BertForSequenceClassification, BertTokenizer
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from configs.config import ATTACK_NUM_EXAMPLES, DATASET, PRETRAINED_MODEL_DIR, RESULTS_DIR
 
-def configure_bertattack_low_resource(attack):
-    """Set BERT-Attack params to match paper defaults (K=48, max_percent=0.4).
-    USE constraint is removed: threshold=0.2 is very lenient and TF+PyTorch
-    GPU coexistence causes hangs on Windows.
-    """
-    attack.transformation.max_candidates = 48
-    # Always remove USE: threshold=0.2 is negligible, and TF hangs on Windows
-    attack.constraints = [
-        c for c in attack.constraints
-        if type(c).__name__ != "UniversalSentenceEncoder"
-    ]
+def configure_bertattack_low_resource(attack, max_candidates=48, keep_use=False):
+    """Set BERT-Attack params. USE is removed by default (TF+PyTorch GPU deadlock on Windows).
+    Pass keep_use=True when running in bertattack_tf env where TF is configured CPU-only."""
+    attack.transformation.max_candidates = max_candidates
+    if not keep_use:
+        attack.constraints = [
+            c for c in attack.constraints
+            if type(c).__name__ != "UniversalSentenceEncoder"
+        ]
     for idx, constraint in enumerate(attack.constraints):
         if isinstance(constraint, MaxWordsPerturbed):
             attack.constraints[idx] = MaxWordsPerturbed(max_percent=0.4)
@@ -129,7 +125,14 @@ class TimeoutAttacker(Attacker):
                 if self.per_example_timeout and _has_sigalrm:
                     signal.signal(signal.SIGALRM, _handle_attack_timeout)
                     signal.alarm(int(self.per_example_timeout))
-                result = self.attack.attack(example, ground_truth_output)
+                    try:
+                        result = self.attack.attack(example, ground_truth_output)
+                    finally:
+                        signal.alarm(0)
+                        signal.signal(signal.SIGALRM, old_handler)
+                else:
+                    # Windows has no SIGALRM; rely on query_budget to cap per-example cost.
+                    result = self.attack.attack(example, ground_truth_output)
             except AttackTimeoutError:
                 print(
                     f"\n[WARNING] Attack timed out for dataset index {idx} "
@@ -142,10 +145,6 @@ class TimeoutAttacker(Attacker):
                 result = FailedAttackResult(original_result)
             except Exception as e:
                 raise e
-            finally:
-                if self.per_example_timeout and _has_sigalrm:
-                    signal.alarm(0)
-                    signal.signal(signal.SIGALRM, old_handler)
 
             if (
                 isinstance(result, SkippedAttackResult) and self.attack_args.attack_n
@@ -216,25 +215,79 @@ def run_single_attack(
     per_example_timeout=None,
     num_examples_offset=0,
     checkpoint_interval=1,
+    args_max_candidates=8,
+    args_keep_use=False,
+    args_query_budget=None,
 ):
-    attack = recipe_class.build(model_wrapper)
+    if recipe_class is BERTAttackLi2020 and not args_keep_use:
+        # Patch USE.__init__ to no-op before build() so TFHub is never loaded.
+        # We remove USE from constraints in configure_bertattack_low_resource anyway.
+        from textattack.constraints.semantics.sentence_encoders import UniversalSentenceEncoder
+        _orig_use_init = UniversalSentenceEncoder.__init__
+        UniversalSentenceEncoder.__init__ = lambda self, *a, **kw: None
+        attack = recipe_class.build(model_wrapper)
+        UniversalSentenceEncoder.__init__ = _orig_use_init
+    else:
+        attack = recipe_class.build(model_wrapper)
     if recipe_class is BERTAttackLi2020:
-        attack = configure_bertattack_low_resource(attack)
-        print("  BERT-Attack params: max_candidates=48, max_percent=0.4")
+        attack = configure_bertattack_low_resource(attack, max_candidates=args_max_candidates, keep_use=args_keep_use)
+        print(f"  BERT-Attack params: max_candidates={args_max_candidates}, max_percent=0.4, keep_use={args_keep_use}")
+    elif not args_keep_use:
+        attack.constraints = [
+            c for c in attack.constraints
+            if type(c).__name__ != "UniversalSentenceEncoder"
+        ]
+        print(f"  USE constraint removed (TF GPU not available on Windows)")
     attack_args = AttackArgs(
         num_examples=num_examples,
         num_examples_offset=num_examples_offset,
         log_to_csv=output_csv,
         csv_coloring_style="plain",
         checkpoint_interval=checkpoint_interval,
-        checkpoint_dir=os.path.join(os.path.dirname(output_csv), "checkpoints"),
+        checkpoint_dir=os.path.join(os.path.dirname(output_csv), "checkpoints",
+                                   os.path.splitext(os.path.basename(output_csv))[0]),
         disable_stdout=False,
+        query_budget=args_query_budget,
     )
+    if args_query_budget:
+        print(f"  Query budget: {args_query_budget} per example")
+
     if per_example_timeout:
         print(f"  Per-example timeout: {per_example_timeout}s")
         attacker = TimeoutAttacker(attack, dataset, attack_args, per_example_timeout=per_example_timeout)
     else:
         attacker = Attacker(attack, dataset, attack_args)
+
+    # Auto-resume from latest valid checkpoint if one exists
+    chkpt_dir = os.path.join(os.path.dirname(output_csv), "checkpoints",
+                             os.path.splitext(os.path.basename(output_csv))[0])
+    chkpt_files = glob.glob(os.path.join(chkpt_dir, "*.ta.chkpt"))
+    if chkpt_files:
+        # Try checkpoints from newest to oldest, skip any with inconsistent state
+        for latest in sorted(chkpt_files, key=os.path.getmtime, reverse=True):
+            try:
+                with open(latest, "rb") as f:
+                    checkpoint = pickle.load(f)
+                # Validate consistency before using
+                if checkpoint.num_remaining_attacks != len(checkpoint.worklist):
+                    print(f"  [SKIP] Inconsistent checkpoint ({checkpoint.results_count} done, "
+                          f"remaining={checkpoint.num_remaining_attacks} vs worklist={len(checkpoint.worklist)}): "
+                          f"{os.path.basename(latest)}")
+                    continue
+                # Fix: new checkpoints use attacker.attack_args (num_examples=200) but
+                # attack_log_manager starts fresh, so num_remaining = 200-1 ≠ len(worklist).
+                # Patch attacker's num_examples to remaining count so verification passes.
+                remaining = checkpoint.num_remaining_attacks
+                attacker._checkpoint = checkpoint
+                attacker.attack_args.num_examples = remaining  # ← key fix, do NOT touch offset
+                print(f"  Resuming from checkpoint ({checkpoint.results_count} done, {remaining} remaining): "
+                      f"{os.path.basename(latest)}")
+                break
+            except Exception as e:
+                print(f"  [SKIP] Could not load {os.path.basename(latest)}: {e}")
+        else:
+            print(f"  No valid checkpoint found, starting fresh.")
+
     results = attacker.attack_dataset()
     return results
 
@@ -329,6 +382,8 @@ def main(args):
             tf_csv,
             num_examples_offset=args.num_examples_offset,
             checkpoint_interval=args.checkpoint_interval,
+            args_keep_use=args.keep_use,
+            args_query_budget=args.query_budget,
         )
         summaries.append(summarize_results(tf_csv, "TextFooler"))
 
@@ -347,6 +402,9 @@ def main(args):
             args.example_timeout,
             args.num_examples_offset,
             args.checkpoint_interval,
+            args_max_candidates=args.max_candidates,
+            args_keep_use=args.keep_use,
+            args_query_budget=args.query_budget,
         )
         summaries.append(summarize_results(ba_csv, "BERT-Attack"))
 
@@ -385,6 +443,23 @@ if __name__ == "__main__":
         choices=["textfooler", "bertattack", "all"],
         default="all",
         help="Which attack to run. Default: both.",
+    )
+    parser.add_argument(
+        "--max_candidates",
+        type=int,
+        default=8,
+        help="Max MLM candidates for BERT-Attack (default: 8).",
+    )
+    parser.add_argument(
+        "--keep_use",
+        action="store_true",
+        help="Keep Universal Sentence Encoder constraint. Requires TF; use in bertattack_tf env.",
+    )
+    parser.add_argument(
+        "--query_budget",
+        type=int,
+        default=None,
+        help="Max model queries per example. None = unlimited. Use ~1000 for robust model eval.",
     )
     args = parser.parse_args()
     main(args)

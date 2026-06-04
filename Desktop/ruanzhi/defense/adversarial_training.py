@@ -26,6 +26,13 @@ import argparse
 import os
 import sys
 
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+try:
+    import tensorflow as tf
+    tf.config.set_visible_devices([], "GPU")  # TF runs on CPU, PyTorch keeps GPU
+except Exception:
+    pass
+
 import torch
 from datasets import Dataset, concatenate_datasets, load_dataset
 from textattack import AttackArgs, Attacker
@@ -107,14 +114,24 @@ def main(args):
 
     tokenizer = BertTokenizer.from_pretrained(args.model_dir)
 
-    # --- Generate adversarial examples ---
-    adv_texts, adv_labels = generate_adversarial_examples(
-        args.model_dir, args.dataset, args.num_adv_examples
-    )
+    # --- Generate adversarial examples (or load existing) ---
+    tmp_csv = os.path.join(args.results_dir, "defense", "adv_train_examples.csv")
+    if args.skip_generation and os.path.exists(tmp_csv):
+        print(f"Skipping generation, loading existing CSV: {tmp_csv}")
+        import pandas as pd
+        df = pd.read_csv(tmp_csv)
+        successful = df[df["result_type"] == "Successful"]
+        adv_texts = successful["perturbed_text"].tolist()
+        adv_labels = successful["ground_truth_output"].tolist()
+        print(f"  Loaded {len(adv_texts)} adversarial examples.")
+    else:
+        adv_texts, adv_labels = generate_adversarial_examples(
+            args.model_dir, args.dataset, args.num_adv_examples
+        )
 
     # --- Build mixed training dataset ---
     print("Building mixed (clean + adversarial) training dataset...")
-    raw = load_dataset(args.dataset)
+    raw = load_dataset(args.dataset, "plain_text")
     clean_subset = raw["train"].select(range(args.num_adv_examples))  # same size as adv
 
     clean_ds = tokenize_texts(
@@ -187,9 +204,11 @@ if __name__ == "__main__":
     parser.add_argument("--model_dir", default=PRETRAINED_MODEL_DIR)
     parser.add_argument("--adv_save_dir", default=ADV_CHECKPOINT_DIR)
     parser.add_argument("--dataset", default=DATASET)
-    parser.add_argument("--num_adv_examples", type=int, default=300)
+    parser.add_argument("--num_adv_examples", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=TRAIN_BATCH_SIZE)
     parser.add_argument("--learning_rate", type=float, default=LEARNING_RATE)
     parser.add_argument("--results_dir", default=RESULTS_DIR)
+    parser.add_argument("--skip_generation", action="store_true",
+                        help="Skip adversarial example generation and load existing CSV.")
     args = parser.parse_args()
     main(args)
