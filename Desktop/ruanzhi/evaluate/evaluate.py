@@ -103,7 +103,7 @@ def _awir_defense_row(json_path, model_label):
     if r is None:
         return None
     return {
-        "Method": f"{model_label} + AWIR",
+        "Method": f"{model_label} + SC-BERT-Attack",
         "Total": r["total"],
         "Successful": r["success"],
         "Failed": r["total"] - r["success"],
@@ -126,8 +126,8 @@ def parse_improved_json(json_path):
 
     rows = []
     name_map = {
-        "WIR_baseline": "WIR (control, ours)",
-        "AWIR_improved": "AWIR (ours, improved)",
+        "WIR_baseline": "BERT-Attack (control, ours)",
+        "AWIR_improved": "SC-BERT-Attack (ours)",
     }
     for key, r in data.items():
         rows.append({
