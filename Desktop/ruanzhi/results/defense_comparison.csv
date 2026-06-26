@@ -1,6 +1,7 @@
 Method,Total,Successful,Failed,Skipped,ASR (%),Avg Words Changed,Avg Queries,Sem. Similarity
 Clean BERT + TextFooler,1000,930,13,57,98.6,,652.5,0.9266
 Robust BERT + TextFooler,200,11,189,0,5.5,,2887.7,0.7897
+Clean BERT + BERT-Attack,200,171,15,14,91.9,,267.2,0.9295
 Robust BERT + BERT-Attack,164,10,154,0,6.1,,790.6,0.7696
 Clean BERT + AWIR,200,39,161,0,19.5,0.009,397.1,0.9923
 Robust BERT + AWIR,200,0,200,0,0.0,0.0,506.1,
