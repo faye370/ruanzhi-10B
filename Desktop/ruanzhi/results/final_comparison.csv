@@ -1,0 +1,4 @@
+Method,Total,Successful,Failed,Skipped,ASR (%),Avg Words Changed,Avg Queries,Sem. Similarity
+TextFooler (Jin 2020),1000,930,13,57,98.6,,652.5,0.9266
+"WIR (control, ours)",200,66,134,0,33.0,0.01,944.4,0.9905
+"AWIR (ours, improved)",200,39,161,0,19.5,0.009,397.1,0.9923
